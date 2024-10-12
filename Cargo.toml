@@ -1,7 +1,10 @@
 [package]
-name = "atomic_bytes"
+name = "crossbytes"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 memmap = "0.7.0"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
