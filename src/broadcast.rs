@@ -1,6 +1,6 @@
 use crate::broadcast::RxErr::Overwritten;
 use crate::bytes::{AtomicRefCell, BytesAtomicView, LoadStore};
-use std::ops::{Add, BitAnd};
+use std::ops::BitAnd;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +70,7 @@ impl<'a> CountersInner<'a> {
     }
     fn new(buffer: BytesAtomicView<'a>) -> CountersInner<'a> {
         let length = buffer.len();
-        assert_eq!(buffer.len(), TRAILER_SIZE);
+        assert_eq!(length, TRAILER_SIZE);
 
         CountersInner { buff: buffer }
     }
@@ -179,6 +179,7 @@ fn align(val: u32, alignment: u32) -> u32 {
     res as u32
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum TxErr {
     InvalidMsgType,
     MsgTooLarge(u32),
@@ -190,8 +191,6 @@ pub enum RxErr {
     // receiver is not consuming messages fast enough to keep up with the transmitter,
     // resulting in messages being overwritten thus making them no longer valid.
     Overwritten,
-
-    InvalidMsgType,
 }
 #[cfg(target_has_atomic = "64")]
 pub struct BroadcastRx<'a> {
@@ -241,13 +240,12 @@ impl<'a> BroadcastRx<'a> {
         if !is_valid {
             self.lapped_count += 1;
             self.cursor = latest_counter.load(Acquire);
-            return Err(RxErr::Overwritten);
         }
         let record_offset = self.cursor.bitand(capacity as u64 - 1);
         let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
         let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
+        let next_record_position = self.cursor + aligned_record_size as u64;
         let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
-        let next_record_position = record_offset + aligned_record_size as u64;
         if PADDING_MSD_ID.inner() == msg_id {
             let record_offset = next_record_position;
             let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
@@ -265,14 +263,12 @@ impl<'a> BroadcastRx<'a> {
 
             read_callback(MsgTypeId(msg_id), data_buffer);
 
-            let res = self.commit_read(record_size, next_record_position);
-            res
+            self.commit_read(record_size, next_record_position)
         } else {
             let start = (record_offset + HEADER_SIZE as u64) as u32;
             let data_buffer = buffer.sub_view(start, record_size - HEADER_SIZE);
             read_callback(MsgTypeId(msg_id), data_buffer);
-            let res = self.commit_read(record_size, next_record_position);
-            res
+            self.commit_read(record_size, next_record_position)
         }
     }
 
@@ -286,6 +282,10 @@ impl<'a> BroadcastRx<'a> {
         let read_ok = (self.cursor + self.buffer.len() as u64) > tail_intent_position;
 
         if read_ok {
+            debug_assert!(
+                self.cursor < next_record_position,
+                "next record position is invalid"
+            );
             self.cursor = next_record_position;
             Ok(record_size)
         } else {
@@ -295,21 +295,102 @@ impl<'a> BroadcastRx<'a> {
             Err(Overwritten)
         }
     }
-    
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::broadcast::RxErr::NoElement;
     use crate::broadcast::{
         align, BroadcastRx, BroadcastTx, MsgTypeId, RxErr, HEADER_SIZE, TRAILER_SIZE,
     };
-    use crate::bytes::{Bytes, BytesAtomicView};
+    use crate::bytes::{Bytes, BytesAtomicView, LoadStore};
+    use rand::Rng;
+    use std::cmp::max;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    use std::thread;
 
     #[test]
     fn test_align() {
         assert_eq!(16, align(12, 8));
         assert_eq!(16, align(16, 8));
         assert_eq!(8, align(6, 8));
+    }
+
+    fn do_read(mut rx: BroadcastRx, stop: &AtomicBool) {
+        let mut read_count = 0u32;
+        let mut previous_val = 0;
+        let mut max_gap = 0;
+        let mut rng = rand::thread_rng();
+        loop {
+            let mut expected_val = 0;
+            let mut x = 0;
+            let mut y = 0;
+            let result = rx.receive_next(|id, slice| {
+                expected_val = id.inner();
+                x = slice.load_at(0, Relaxed);
+                y = slice.load_at(4, Relaxed);
+                if rng.gen() {
+                    thread::yield_now(); //rnd yeild to weed out any concurrency issues
+                }
+            });
+            match result {
+                Err(NoElement) => {
+                    if stop.load(Acquire) {
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    assert_eq!(x, expected_val);
+                    assert_eq!(y, expected_val);
+                    assert!(expected_val > previous_val);
+                    read_count += 1;
+                    max_gap = max(max_gap, (expected_val - previous_val));
+                    previous_val = expected_val;
+                }
+                Err(RxErr::Overwritten) => {}
+            }
+        }
+        println!(
+            "thread_id={:?}, read {} messages, lapped_count={}, max_gap={}",
+            thread::current().id(),
+            read_count,
+            rx.lapped_count(),
+            max_gap
+        );
+    }
+    #[test]
+    fn test_concurrent_send_receive() {
+        let bytes = Bytes::heap_allocate(4096 * 16 + TRAILER_SIZE);
+        let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
+        let mut tx = BroadcastTx::new(buffer.clone());
+        let rx_0 = BroadcastRx::new(buffer.clone());
+        let rx_1 = BroadcastRx::new(buffer.clone());
+        let max_count = 1000_000;
+        let stop = AtomicBool::new(false);
+        thread::scope(|s| {
+            s.spawn(|| do_read(rx_0, &stop)); //start two reading threads
+            s.spawn(|| do_read(rx_1, &stop));
+
+            let mut rng = rand::thread_rng();
+            for i in 1..=max_count {
+                let result = tx.transmit(8, MsgTypeId(i), |mut buff| {
+                    buff.store_at(0, i, Relaxed);
+                    buff.store_at(4, i, Relaxed);
+                    8
+                });
+                if result.is_err() {
+                    stop.store(true, Release);
+                    println!("error {:?}", result);
+                }
+                assert_eq!(Ok(16), result); //4 byte header + 8 bytes of data
+                let yeild: bool = rng.gen();
+                if yeild {
+                    thread::yield_now();
+                }
+            }
+            stop.store(true, Release);
+        });
     }
     #[test]
     fn test_send_receive() {
@@ -323,6 +404,7 @@ mod tests {
             *(&mut bytes[1]) = 0xF0u8;
             2
         });
+        assert_eq!(Ok(16), res);
 
         let mut one = 0;
         let mut two = 0;
@@ -332,6 +414,7 @@ mod tests {
             two = slice[1];
             assert_eq!(4, slice.len());
         });
+        assert_eq!(Ok(12), res, "unsuccessful read");
 
         assert_eq!(one, 0xFFu8);
         assert_eq!(two, 0xF0u8);
@@ -352,9 +435,6 @@ mod tests {
             });
             assert!(res.is_ok());
         }
-
-        let res = rx.receive_next(|id, slice| {});
-        assert_eq!(Err(RxErr::Overwritten), res);
 
         //next receive should receive the latest message
         let res = rx.receive_next(|id, slice| {
@@ -380,10 +460,10 @@ mod tests {
         assert!(res.is_ok());
 
         //scenario while reading, publisher updates
-        let res = rx.receive_next(|id, slice| {
+        let res = rx.receive_next(|_, _| {
             let tx = &mut tx;
             for i in 1..5 {
-                tx.transmit(4u32, MsgTypeId(i), |mut bytes| {
+                let _ = tx.transmit(4u32, MsgTypeId(i), |mut bytes| {
                     *(&mut bytes[0]) = i as u8;
                     *(&mut bytes[1]) = i as u8;
                     2
