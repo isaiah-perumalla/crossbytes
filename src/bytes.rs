@@ -36,6 +36,10 @@ impl Bytes {
         Self::memap(mmap.unwrap())
     }
 }
+
+/// will heap allocate size bytes
+/// ensure memory is zeroed out
+///
 fn heap_allocate(size: usize) -> NonNull<u8> {
     let new_layout = Layout::array::<u8>(size).unwrap();
     // Ensure that the new allocation doesn't exceed `isize::MAX` bytes.
@@ -43,14 +47,15 @@ fn heap_allocate(size: usize) -> NonNull<u8> {
         new_layout.size() <= isize::MAX as usize,
         "Allocation too large"
     );
-    let allocated_ptr = unsafe { alloc::alloc(new_layout) };
+    let allocated_ptr = unsafe { alloc::alloc_zeroed(new_layout) };
     // If allocation fails, `new_ptr` will be null, in which case we abort.
-    let ptr = match NonNull::new(allocated_ptr) {
+    match NonNull::new(allocated_ptr) {
         Some(p) => p,
         None => alloc::handle_alloc_error(new_layout),
-    };
-    ptr
+    }
 }
+unsafe impl Sync for Bytes {}
+unsafe impl Send for Bytes {}
 
 impl Bytes {
     pub fn heap_allocate(size: usize) -> Bytes {
@@ -115,21 +120,19 @@ impl<'a> BytesAtomicView<'a> {
         let start = range_from.start as usize;
         assert!(start < self.length);
         let new_len = self.length - start;
-        let buffer = BytesAtomicView {
+        BytesAtomicView {
             offset: self.offset + start,
             length: new_len,
-            bytes: self.bytes
-        };
-        buffer
+            bytes: self.bytes,
+        }
     }
     pub fn sub_view(&self, start: u32, length: u32) -> BytesAtomicView<'a> {
-        assert!((start + length ) as usize <= self.length );
-        let buffer = BytesAtomicView {
+        assert!((start + length) as usize <= self.length);
+        BytesAtomicView {
             offset: self.offset + start as usize,
             length: length as usize,
             bytes: self.bytes,
-        };
-        buffer
+        }
     }
     unsafe fn data_ptr(&self) -> *mut u8 {
         self.bytes.bytes.as_ptr().add(self.offset)
@@ -151,15 +154,13 @@ impl<'a> DerefMut for BytesAtomicView<'a> {
 
 impl<'a> Clone for BytesAtomicView<'a> {
     fn clone(&self) -> Self {
-        let buffer = BytesAtomicView {
+        BytesAtomicView {
             offset: self.offset,
             length: self.length,
             bytes: self.bytes,
-        };
-        buffer
+        }
     }
 }
-
 
 pub trait AtomicRefCell<'a, T> {
     /// return a reference to an atomic view of type T
@@ -171,7 +172,6 @@ pub trait LoadStore<T> {
     fn load_at(&self, offset: usize, ordering: Ordering) -> T;
     fn store_at(&mut self, offset: usize, val: T, ordering: Ordering);
 }
-
 
 macro_rules! load_store_impl {
     ($type: ty, $atomic_ty: ty) => {
@@ -230,13 +230,12 @@ load_store_impl!(i32, AtomicI32);
 load_store_impl!(i16, AtomicI16);
 load_store_impl!(i8, AtomicI8);
 
-
 #[cfg(test)]
 mod tests {
 
     use crate::bytes::{AtomicRefCell, Bytes, BytesAtomicView, LoadStore};
-    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
     use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
     #[test]
     fn test_atomic_ref() {
@@ -281,14 +280,13 @@ mod tests {
         assert_eq!(75u64, buffer.load_at(0, Ordering::Relaxed));
     }
 
-    
     #[test]
     fn test_sub_slice() {
         let bytes = Bytes::heap_allocate(32);
         let mut buffer: BytesAtomicView = BytesAtomicView::from_bytes(0, 16, &bytes);
         buffer.store_at(8, 8u64, Relaxed);
         let mut sub_slice = buffer.sub_slice(8..);
-        let val : u64 = buffer.load_at(8, Relaxed);
+        let val: u64 = buffer.load_at(8, Relaxed);
         assert_eq!(val, sub_slice.load_at(0, Relaxed))
     }
     #[test]
