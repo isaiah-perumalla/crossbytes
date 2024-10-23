@@ -1,7 +1,7 @@
 use memmap::MmapMut;
 use std::alloc;
 use std::alloc::Layout;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::ops::{Deref, DerefMut, RangeFrom};
 use std::path::Path;
 use std::ptr::NonNull;
@@ -29,9 +29,7 @@ pub struct Bytes {
 }
 
 impl Bytes {
-    pub fn from_file_backed<P: AsRef<Path>>(file: P, size: u64) -> Self {
-        let file = File::create_new(file).expect("failed to open the file");
-        file.set_len(size).expect("filed to set size");
+    pub fn from_file_backed(file: File) -> Self {
         let mmap = unsafe { MmapMut::map_mut(&file) };
         Self::memap(mmap.unwrap())
     }

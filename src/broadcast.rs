@@ -1,28 +1,36 @@
-use std::num::NonZero;
 use crate::broadcast::RxErr::Overwritten;
 use crate::bytes::{AtomicRefCell, BytesAtomicView, LoadStore};
 use std::ops::BitAnd;
 use std::sync::atomic;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-const TRAILER_SIZE: usize = 128;
+pub const TRAILER_SIZE: usize = 128;
+pub const HEADER_SIZE: u32 = 8;
+pub const RECORD_ALIGNMENT: u32 = 8;
+
 const TAIL_INTENT_COUNTER_OFFSET: u32 = 0;
 const TAIL_COUNTER_OFFSET: u32 = TAIL_INTENT_COUNTER_OFFSET + (size_of::<u64>() as u32);
 const LAST_COUNTER_OFFSET: u32 = TAIL_COUNTER_OFFSET + (size_of::<u64>() as u32);
-const HEADER_SIZE: u32 = 8;
-const RECORD_ALIGNMENT: u32 = 8;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct MsgTypeId(NonZero<u32>);
+pub struct MsgTypeId(i32);
 
 impl MsgTypeId {
     pub fn inner(&self) -> u32 {
-        self.0.get()
+        self.0 as u32
     }
     pub fn from(val: u32) -> MsgTypeId {
-        MsgTypeId(NonZero::new(val).expect("invalid msgId"))
+        let signed = val as i32;
+        assert!(signed > 0, "msg id cannot be -ve");
+        MsgTypeId(signed)
     }
+}
+
+#[inline]
+fn buffer_index(size: usize, position: u64) -> u32 {
+    debug_assert!(size.is_power_of_two());
+    position.bitand(size as u64 - 1) as u32
 }
 
 struct CountersInner<'a> {
@@ -51,12 +59,10 @@ impl<'a> CountersInner<'a> {
         debug_assert!(is_aligned8(self.tail_counter().load(Relaxed)));
         debug_assert!(is_aligned8(self.tail_intent_counter().load(Relaxed)));
         debug_assert!(
-            self.latest_record_counter().load(Ordering::Acquire)
-                <= self.tail_counter().load(Ordering::Relaxed)
+            self.latest_record_counter().load(Acquire) <= self.tail_counter().load(Relaxed)
         );
         debug_assert!(
-            self.tail_counter().load(Ordering::Relaxed)
-                <= self.tail_intent_counter().load(Ordering::Relaxed)
+            self.tail_counter().load(Relaxed) <= self.tail_intent_counter().load(Relaxed)
         );
     }
 
@@ -69,6 +75,8 @@ impl<'a> CountersInner<'a> {
         self.latest_record_counter()
             .store(latest_value_counter, Release);
         self.tail_counter().store(tail_counter, Release);
+
+        #[cfg(debug_assertions)]
         self.check_invariants();
     }
     fn new(buffer: BytesAtomicView<'a>) -> CountersInner<'a> {
@@ -114,9 +122,10 @@ impl<'a> BroadcastTx<'a> {
         let capacity = self.buffer.len() as u32;
         let tail_counter = self.counters_inner.tail_counter();
         let tail_intent_counter = self.counters_inner.tail_intent_counter();
+
         //relaxed load is sufficient as only this thread can mutate this value
         let current_tail: u64 = tail_counter.load(Relaxed);
-        let record_offset = current_tail.bitand(capacity as u64 - 1) as u32;
+        let record_offset = buffer_index(self.buffer.len(), current_tail);
         let record_len = msg_size + HEADER_SIZE;
         let aligned_record_len = align(record_len, RECORD_ALIGNMENT);
         let new_tail = current_tail + aligned_record_len as u64;
@@ -125,15 +134,17 @@ impl<'a> BroadcastTx<'a> {
             //record cannot fit in given capacity, to avoid wrapping
             //insert padding
             let padding_size = capacity - record_offset;
+            debug_assert!(
+                padding_size >= HEADER_SIZE,
+                "padding must be atleast size of header"
+            );
             //we are adding padding + data for new tail
             let tail_intent = new_tail + padding_size as u64;
             tail_intent_counter.store(tail_intent, Release);
             // //ensure all writes above this fence happen before all write below the fence
             atomic::fence(Release);
-            let mut padding_buf = self
-                .buffer
-                .sub_view(record_offset, padding_size + HEADER_SIZE);
-            Self::write_header(0, &mut padding_buf, padding_size);
+            let mut padding_buf = self.buffer.sub_view(record_offset, padding_size);
+            Self::write_header(PADDING_ID, &mut padding_buf, padding_size);
 
             //record_offset wraps for actual data
             let mut buffer = self.buffer.sub_view(0, msg_size + HEADER_SIZE);
@@ -199,6 +210,8 @@ pub struct BroadcastRx<'a> {
     lapped_count: u64,
 }
 
+const PADDING_ID: u32 = -1i32 as u32;
+
 impl<'a> BroadcastRx<'a> {
     pub fn new(buffer: BytesAtomicView<'a>) -> BroadcastRx<'a> {
         let capacity: u32 = (buffer.len() - TRAILER_SIZE) as u32;
@@ -229,33 +242,36 @@ impl<'a> BroadcastRx<'a> {
         let latest_counter = self.counters.latest_record_counter();
         let tail = tail_counter.load(Acquire);
 
-        if tail == self.cursor {
+        if tail <= self.cursor {
             return Err(RxErr::NoElement);
         }
-        assert!(tail > self.cursor, "invalid state cursor cannot be > tail");
+        //it possible for tail < self.cursor, as cursor could read latest record but not commited
+        //in this case it should not be read, above guard will ensure that
+        // assert!(tail > self.cursor, "invalid state cursor cannot be > tail");
 
         let tail_intent_position = tail_intent_counter.load(Acquire);
         let is_valid = (self.cursor + capacity as u64) > tail_intent_position;
         if !is_valid {
             self.lapped_count += 1;
-            self.cursor = latest_counter.load(Acquire);
+            let latest_position = latest_counter.load(Acquire);
+            self.cursor = latest_position;
         }
-        let record_offset = self.cursor.bitand(capacity as u64 - 1);
+        let record_offset = buffer_index(capacity, self.cursor);
         let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
         let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
         let next_record_position = self.cursor + aligned_record_size as u64;
         let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
-        if 0 == msg_id {
-            let record_offset = next_record_position;
+        if PADDING_ID == msg_id {
+            debug_assert!(
+                buffer_index(capacity, next_record_position) == 0,
+                "should wrap to start after pad"
+            );
+            let record_offset = 0;
             let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
             let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
             let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
-            assert_ne!(
-                msg_id,
-                0,
-                "cannot have two consecutive paddings"
-            );
-            let next_record_position = record_offset + aligned_record_size as u64;
+            assert_ne!(msg_id, PADDING_ID, "cannot have two consecutive paddings");
+            let next_record_position = next_record_position + aligned_record_size as u64;
             let start = (record_offset + HEADER_SIZE as u64) as u32;
 
             let data_buffer = buffer.sub_view(start, record_size - HEADER_SIZE);
@@ -264,8 +280,9 @@ impl<'a> BroadcastRx<'a> {
 
             self.commit_read(record_size, next_record_position)
         } else {
-            let start = (record_offset + HEADER_SIZE as u64) as u32;
-            let data_buffer = buffer.sub_view(start, record_size - HEADER_SIZE);
+            let start = record_offset + HEADER_SIZE;
+            let length = record_size - HEADER_SIZE;
+            let data_buffer = buffer.sub_view(start, length);
             read_callback(MsgTypeId::from(msg_id), data_buffer);
             self.commit_read(record_size, next_record_position)
         }
@@ -299,9 +316,7 @@ impl<'a> BroadcastRx<'a> {
 #[cfg(test)]
 mod tests {
     use crate::broadcast::RxErr::NoElement;
-    use crate::broadcast::{
-        align, BroadcastRx, BroadcastTx, MsgTypeId, RxErr, HEADER_SIZE, TRAILER_SIZE,
-    };
+    use crate::broadcast::{align, BroadcastRx, BroadcastTx, MsgTypeId, RxErr, TxErr, HEADER_SIZE, TRAILER_SIZE};
     use crate::bytes::{Bytes, BytesAtomicView, LoadStore};
     use rand::Rng;
     use std::cmp::max;
@@ -359,6 +374,52 @@ mod tests {
         );
     }
     #[test]
+    fn test_padding() {
+        let bytes = Bytes::heap_allocate(512 + TRAILER_SIZE);
+        let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
+        let mut tx = BroadcastTx::new(buffer.clone());
+        let mut rx_0 = BroadcastRx::new(buffer.clone());
+
+        //add 10 messages which is 24 * 21 = 508 bytes
+        for i in 0..21 {
+            let msg_id = MsgTypeId::from(1);
+            let res = tx.transmit(16u32, msg_id, |mut bytes| {
+                *(&mut bytes[0]) = i + 1;
+                *(&mut bytes[1]) = i + 2;
+                2
+            });
+            assert_eq!(Ok(24), res);
+        }
+        let mut id = 0;
+        let mut b0 = 0u8;
+        let mut b1 = 0u8;
+        let mut size = 0;
+        let read_res = rx_0.receive_next(|msg_id, buffer| {
+            size = buffer.len();
+            b0 = buffer[0];
+            b1 = buffer[1];
+            id = msg_id.inner()
+        });
+        assert_eq!(size, 16, "size of payload");
+        assert_eq!(Ok(24), read_res);
+
+        //will create padding 16 byte padding
+        let res = tx.transmit(16u32, MsgTypeId::from(12), |mut bytes| {
+            *(&mut bytes[0]) = 12;
+            *(&mut bytes[1]) = 13;
+            2
+        });
+        assert_eq!(Ok(24 + 8), res); // 24 for data + 8 for padding
+        let read_res = rx_0.receive_next(|msg_id, buffer| {
+            size = buffer.len();
+            b0 = buffer[0];
+            b1 = buffer[1];
+            id = msg_id.inner()
+        });
+        assert_eq!(size, 16, "size of payload");
+        assert_eq!(Ok(24), read_res);
+    }
+    #[test]
     fn test_concurrent_send_receive() {
         let bytes = Bytes::heap_allocate(4096 * 16 + TRAILER_SIZE);
         let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
@@ -373,7 +434,7 @@ mod tests {
 
             let mut rng = rand::thread_rng();
             for i in 1..=max_count {
-                let result = tx.transmit(8, MsgTypeId::from(i), |mut buff| {
+                let result = tx.transmit(12, MsgTypeId::from(i), |mut buff| {
                     buff.store_at(0, i, Relaxed);
                     buff.store_at(4, i, Relaxed);
                     8
@@ -382,7 +443,14 @@ mod tests {
                     stop.store(true, Release);
                     println!("error {:?}", result);
                 }
-                assert_eq!(Ok(16), result); //4 byte header + 8 bytes of data
+                match result {
+                    Ok(24) => {}
+                    Ok(40) => {} //msg with padding can be 40
+                    _ => {
+                        stop.store(true, Release);
+                        assert_eq!(Ok(24), result);
+                    } //failed 
+                }
                 let yeild: bool = rng.gen();
                 if yeild {
                     thread::yield_now();
@@ -503,5 +571,9 @@ mod tests {
             assert_eq!(4, slice[1]);
         });
         assert_eq!(Ok(4 + HEADER_SIZE), res);
+
+        //next read should err no element
+        let res = rx.receive_next(|id, slice| {});
+        assert_eq!(Err(NoElement), res);
     }
 }
