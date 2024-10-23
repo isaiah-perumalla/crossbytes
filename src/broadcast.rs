@@ -1,3 +1,4 @@
+use std::num::NonZero;
 use crate::broadcast::RxErr::Overwritten;
 use crate::bytes::{AtomicRefCell, BytesAtomicView, LoadStore};
 use std::ops::BitAnd;
@@ -11,14 +12,16 @@ const TAIL_COUNTER_OFFSET: u32 = TAIL_INTENT_COUNTER_OFFSET + (size_of::<u64>() 
 const LAST_COUNTER_OFFSET: u32 = TAIL_COUNTER_OFFSET + (size_of::<u64>() as u32);
 const HEADER_SIZE: u32 = 8;
 const RECORD_ALIGNMENT: u32 = 8;
-const PADDING_MSD_ID: MsgTypeId = MsgTypeId(0);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct MsgTypeId(u32);
+pub struct MsgTypeId(NonZero<u32>);
 
 impl MsgTypeId {
     pub fn inner(&self) -> u32 {
-        self.0
+        self.0.get()
+    }
+    pub fn from(val: u32) -> MsgTypeId {
+        MsgTypeId(NonZero::new(val).expect("invalid msgId"))
     }
 }
 
@@ -105,9 +108,6 @@ impl<'a> BroadcastTx<'a> {
     where
         F: Fn(BytesAtomicView) -> usize,
     {
-        if id == PADDING_MSD_ID {
-            return Err(TxErr::InvalidMsgType);
-        }
         if msg_size > self.max_msg_size() {
             return Err(TxErr::MsgTooLarge(msg_size));
         }
@@ -133,11 +133,11 @@ impl<'a> BroadcastTx<'a> {
             let mut padding_buf = self
                 .buffer
                 .sub_view(record_offset, padding_size + HEADER_SIZE);
-            Self::write_header(PADDING_MSD_ID, &mut padding_buf, padding_size);
+            Self::write_header(0, &mut padding_buf, padding_size);
 
             //record_offset wraps for actual data
             let mut buffer = self.buffer.sub_view(0, msg_size + HEADER_SIZE);
-            Self::write_header(id, &mut buffer, record_len);
+            Self::write_header(id.inner(), &mut buffer, record_len);
             let data_buffer = self.buffer.sub_view(HEADER_SIZE, msg_size);
             f(data_buffer);
             let latest_record_counter = current_tail;
@@ -151,7 +151,7 @@ impl<'a> BroadcastTx<'a> {
             atomic::fence(Release);
             let mut buffer = self.buffer.sub_view(record_offset, msg_size + HEADER_SIZE);
 
-            Self::write_header(id, &mut buffer, record_len);
+            Self::write_header(id.inner(), &mut buffer, record_len);
 
             let data_slot = buffer.sub_view(HEADER_SIZE, msg_size);
             f(data_slot);
@@ -160,9 +160,9 @@ impl<'a> BroadcastTx<'a> {
         }
     }
 
-    fn write_header(id: MsgTypeId, buffer: &mut BytesAtomicView, record_len: u32) {
+    fn write_header(id: u32, buffer: &mut BytesAtomicView, record_len: u32) {
         buffer.store_at(0, record_len, Relaxed);
-        buffer.store_at(4, id.0, Relaxed);
+        buffer.store_at(4, id, Relaxed);
     }
 }
 
@@ -181,7 +181,6 @@ fn align(val: u32, alignment: u32) -> u32 {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum TxErr {
-    InvalidMsgType,
     MsgTooLarge(u32),
 }
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -246,14 +245,14 @@ impl<'a> BroadcastRx<'a> {
         let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
         let next_record_position = self.cursor + aligned_record_size as u64;
         let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
-        if PADDING_MSD_ID.inner() == msg_id {
+        if 0 == msg_id {
             let record_offset = next_record_position;
             let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
             let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
             let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
             assert_ne!(
                 msg_id,
-                PADDING_MSD_ID.inner(),
+                0,
                 "cannot have two consecutive paddings"
             );
             let next_record_position = record_offset + aligned_record_size as u64;
@@ -261,13 +260,13 @@ impl<'a> BroadcastRx<'a> {
 
             let data_buffer = buffer.sub_view(start, record_size - HEADER_SIZE);
 
-            read_callback(MsgTypeId(msg_id), data_buffer);
+            read_callback(MsgTypeId::from(msg_id), data_buffer);
 
             self.commit_read(record_size, next_record_position)
         } else {
             let start = (record_offset + HEADER_SIZE as u64) as u32;
             let data_buffer = buffer.sub_view(start, record_size - HEADER_SIZE);
-            read_callback(MsgTypeId(msg_id), data_buffer);
+            read_callback(MsgTypeId::from(msg_id), data_buffer);
             self.commit_read(record_size, next_record_position)
         }
     }
@@ -374,7 +373,7 @@ mod tests {
 
             let mut rng = rand::thread_rng();
             for i in 1..=max_count {
-                let result = tx.transmit(8, MsgTypeId(i), |mut buff| {
+                let result = tx.transmit(8, MsgTypeId::from(i), |mut buff| {
                     buff.store_at(0, i, Relaxed);
                     buff.store_at(4, i, Relaxed);
                     8
@@ -398,7 +397,7 @@ mod tests {
         let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
         let mut tx = BroadcastTx::new(buffer.clone());
         let mut rx = BroadcastRx::new(buffer.clone());
-        let msg_id = MsgTypeId(1);
+        let msg_id = MsgTypeId::from(1);
         let res = tx.transmit(4u32, msg_id, |mut bytes| {
             *(&mut bytes[0]) = 0xFFu8;
             *(&mut bytes[1]) = 0xF0u8;
@@ -409,7 +408,7 @@ mod tests {
         let mut one = 0;
         let mut two = 0;
         let res = rx.receive_next(|id, slice| {
-            assert_eq!(1, id.0);
+            assert_eq!(1, id.inner());
             one = slice[0];
             two = slice[1];
             assert_eq!(4, slice.len());
@@ -427,7 +426,7 @@ mod tests {
         let mut tx = BroadcastTx::new(buffer.clone());
         let mut rx = BroadcastRx::new(buffer.clone());
         for i in 1..5 {
-            let msg_id = MsgTypeId(i);
+            let msg_id = MsgTypeId::from(i);
             let res = tx.transmit(4u32, msg_id, |mut bytes| {
                 *(&mut bytes[0]) = i as u8;
                 *(&mut bytes[1]) = i as u8;
@@ -438,7 +437,7 @@ mod tests {
 
         //next receive should receive the latest message
         let res = rx.receive_next(|id, slice| {
-            assert_eq!(4, id.0);
+            assert_eq!(4, id.inner());
             assert_eq!(4, slice[0]);
             assert_eq!(4, slice[1]);
         });
@@ -451,7 +450,7 @@ mod tests {
         let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
         let mut tx = BroadcastTx::new(buffer.clone());
         let mut rx = BroadcastRx::new(buffer.clone());
-        let msg_id = MsgTypeId(1);
+        let msg_id = MsgTypeId::from(1);
         let res = tx.transmit(4u32, msg_id, |mut bytes| {
             *(&mut bytes[0]) = 1 as u8;
             *(&mut bytes[1]) = 1 as u8;
@@ -463,7 +462,7 @@ mod tests {
         let res = rx.receive_next(|_, _| {
             let tx = &mut tx;
             for i in 1..5 {
-                let _ = tx.transmit(4u32, MsgTypeId(i), |mut bytes| {
+                let _ = tx.transmit(4u32, MsgTypeId::from(i), |mut bytes| {
                     *(&mut bytes[0]) = i as u8;
                     *(&mut bytes[1]) = i as u8;
                     2
@@ -474,7 +473,7 @@ mod tests {
         assert_eq!(1, rx.lapped_count());
 
         let res = rx.receive_next(|id, slice| {
-            assert_eq!(id, MsgTypeId(4));
+            assert_eq!(id, MsgTypeId::from(4));
             assert_eq!(4, slice[0]);
             assert_eq!(4, slice[1]);
         });
@@ -486,7 +485,7 @@ mod tests {
         let buffer = BytesAtomicView::from_bytes(0, bytes.capacity(), &bytes);
         let mut tx = BroadcastTx::new(buffer.clone());
         for i in 1..5 {
-            let msg_id = MsgTypeId(i);
+            let msg_id = MsgTypeId::from(i);
             let res = tx.transmit(4u32, msg_id, |mut bytes| {
                 *(&mut bytes[0]) = i as u8;
                 *(&mut bytes[1]) = i as u8;
@@ -499,7 +498,7 @@ mod tests {
 
         //next receive should receive the latest message
         let res = rx.receive_next(|id, slice| {
-            assert_eq!(4, id.0);
+            assert_eq!(4, id.inner());
             assert_eq!(4, slice[0]);
             assert_eq!(4, slice[1]);
         });
