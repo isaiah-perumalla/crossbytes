@@ -10,6 +10,7 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.TimeUnit;
 
 public class BroadcastReceiverTest {
     public static void main(String[] args) throws IOException {
@@ -24,7 +25,11 @@ public class BroadcastReceiverTest {
         UnsafeBuffer scratch = new UnsafeBuffer(new byte[64]);
         System.out.println("Receiving from shm file [" + filePath + "]");
         int count = 0;
-        while(true) {
+        long lastVal = 0;
+        int lastMsgId = 0;
+        long timeNow = System.nanoTime();
+        long endTime = timeNow + TimeUnit.SECONDS.toNanos(60);
+        while(System.nanoTime() < endTime) {
             int msgId = 0;
             long val0 = 0;
             long val1 = 0;
@@ -36,14 +41,12 @@ public class BroadcastReceiverTest {
                 val1 = receiver.buffer().getLong(offset + 8);
             }
             if (ok && receiver.validate()) {
-                assert msgId == val0;
+                assert msgId != lastMsgId;
+                assert val0 > lastVal;
                 assert val1 == 1 + val0;
                 count++;
             }
-            if (count == 1000_000_000) {
-                break;
-            }
         }
-        System.out.println("receive completed [" + count + "] message received");
+        System.out.println("receive completed [" + count + "] message received" + "lapped-count[" + receiver.lappedCount() + "]");
     }
 }

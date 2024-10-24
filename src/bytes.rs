@@ -1,9 +1,8 @@
 use memmap::MmapMut;
 use std::alloc;
 use std::alloc::Layout;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::ops::{Deref, DerefMut, RangeFrom};
-use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{
     AtomicBool, AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicU16, AtomicU32, AtomicU64,
@@ -116,7 +115,7 @@ impl<'a> BytesAtomicView<'a> {
 
     pub fn sub_slice(&self, range_from: RangeFrom<u32>) -> BytesAtomicView<'a> {
         let start = range_from.start as usize;
-        assert!(start < self.length);
+        debug_assert!(start < self.length);
         let new_len = self.length - start;
         BytesAtomicView {
             offset: self.offset + start,
@@ -125,7 +124,7 @@ impl<'a> BytesAtomicView<'a> {
         }
     }
     pub fn sub_view(&self, start: u32, length: u32) -> BytesAtomicView<'a> {
-        assert!((start + length) as usize <= self.length);
+        debug_assert!((start + length) as usize <= self.length);
         BytesAtomicView {
             offset: self.offset + start as usize,
             length: length as usize,
@@ -230,7 +229,6 @@ load_store_impl!(i8, AtomicI8);
 
 #[cfg(test)]
 mod tests {
-
     use crate::bytes::{AtomicRefCell, Bytes, BytesAtomicView, LoadStore};
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};

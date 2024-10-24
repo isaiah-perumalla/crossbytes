@@ -1,4 +1,4 @@
-use crate::broadcast::RxErr::Overwritten;
+use crate::agrona::broadcast::RxErr::Overwritten;
 use crate::bytes::{AtomicRefCell, BytesAtomicView, LoadStore};
 use std::ops::BitAnd;
 use std::sync::atomic;
@@ -10,7 +10,7 @@ pub const HEADER_SIZE: u32 = 8;
 pub const RECORD_ALIGNMENT: u32 = 8;
 
 const TAIL_INTENT_COUNTER_OFFSET: u32 = 0;
-const TAIL_COUNTER_OFFSET: u32 = TAIL_INTENT_COUNTER_OFFSET + (size_of::<u64>() as u32);
+pub const TAIL_COUNTER_OFFSET: u32 = TAIL_INTENT_COUNTER_OFFSET + (size_of::<u64>() as u32);
 const LAST_COUNTER_OFFSET: u32 = TAIL_COUNTER_OFFSET + (size_of::<u64>() as u32);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -22,7 +22,7 @@ impl MsgTypeId {
     }
     pub fn from(val: u32) -> MsgTypeId {
         let signed = val as i32;
-        assert!(signed > 0, "msg id cannot be -ve");
+        debug_assert!(signed >= 0, "msg id cannot be -ve");
         MsgTypeId(signed)
     }
 }
@@ -177,7 +177,8 @@ impl<'a> BroadcastTx<'a> {
     }
 }
 
-#[inline]
+
+#[cfg(debug_assertions)]
 fn is_aligned8(val: u64) -> bool {
     0 == val.bitand(7) // check aligned to 8
 }
@@ -242,12 +243,16 @@ impl<'a> BroadcastRx<'a> {
         let latest_counter = self.counters.latest_record_counter();
         let tail = tail_counter.load(Acquire);
 
+        //it possible for tail < self.cursor, as cursor could read latest record but not commited
+        //in this case it should not be read, above guard will ensure that
+        debug_assert!(
+            tail_intent_counter.load(Acquire) >= self.cursor,
+            "invalid state cursor cannot be > tail-intent"
+        );
+
         if tail <= self.cursor {
             return Err(RxErr::NoElement);
         }
-        //it possible for tail < self.cursor, as cursor could read latest record but not commited
-        //in this case it should not be read, above guard will ensure that
-        // assert!(tail > self.cursor, "invalid state cursor cannot be > tail");
 
         let tail_intent_position = tail_intent_counter.load(Acquire);
         let is_valid = (self.cursor + capacity as u64) > tail_intent_position;
@@ -270,7 +275,7 @@ impl<'a> BroadcastRx<'a> {
             let record_size: u32 = buffer.load_at(record_offset as usize, Relaxed);
             let aligned_record_size: u32 = align(record_size, RECORD_ALIGNMENT);
             let msg_id: u32 = buffer.load_at(record_offset as usize + 4, Relaxed);
-            assert_ne!(msg_id, PADDING_ID, "cannot have two consecutive paddings");
+            debug_assert_ne!(msg_id, PADDING_ID, "cannot have two consecutive paddings");
             let next_record_position = next_record_position + aligned_record_size as u64;
             let start = (record_offset + HEADER_SIZE as u64) as u32;
 
@@ -315,15 +320,17 @@ impl<'a> BroadcastRx<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::broadcast::RxErr::NoElement;
-    use crate::broadcast::{align, BroadcastRx, BroadcastTx, MsgTypeId, RxErr, TxErr, HEADER_SIZE, TRAILER_SIZE};
+    use crate::agrona::broadcast::RxErr::NoElement;
+    use crate::agrona::broadcast::{
+        align, BroadcastRx, BroadcastTx, MsgTypeId, RxErr, TxErr, HEADER_SIZE, TRAILER_SIZE,
+    };
     use crate::bytes::{Bytes, BytesAtomicView, LoadStore};
     use rand::Rng;
     use std::cmp::max;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     use std::thread;
-
+    
     #[test]
     fn test_align() {
         assert_eq!(16, align(12, 8));
@@ -448,8 +455,8 @@ mod tests {
                     Ok(40) => {} //msg with padding can be 40
                     _ => {
                         stop.store(true, Release);
-                        assert_eq!(Ok(24), result);
-                    } //failed 
+                        panic!("invalid result");
+                    } //failed
                 }
                 let yeild: bool = rng.gen();
                 if yeild {
